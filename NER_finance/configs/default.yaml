@@ -1,0 +1,86 @@
+# ============================================================
+# Financial NER Pipeline — Default Configuration
+# ============================================================
+# Edit this file to control every aspect of the experiment.
+# Run:
+#   accelerate launch --multi_gpu --num_processes=2 train.py \
+#       --config configs/default.yaml
+
+# ── Model ────────────────────────────────────────────────────
+model:
+  # Unsloth-optimised instruct model (4-bit quantised)
+  # Options:
+  #   "unsloth/Phi-3-mini-4k-instruct-bnb-4bit"   ← fast, low VRAM
+  #   "unsloth/llama-3-8b-Instruct-bnb-4bit"      ← higher accuracy
+  #   "unsloth/mistral-7b-instruct-v0.2-bnb-4bit"
+  name: "unsloth/Phi-3-mini-4k-instruct-bnb-4bit"
+  max_seq_length: 1024
+  seed: 42
+
+# ── LoRA ─────────────────────────────────────────────────────
+lora:
+  r: 16
+  alpha: 16
+  dropout: 0.0     # Unsloth recommends 0.0 for maximum speed
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# ── Training ─────────────────────────────────────────────────
+training:
+  # Training format:
+  #   "causal"      → plain text "input\n\n### Output:\n{json}"  (base models)
+  #   "instruction" → ChatML System/User/Assistant               (instruct models)
+  format: "instruction"
+
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  epochs: 3
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  output_dir: "/kaggle/working/outputs"
+  logging_steps: 10
+  eval_steps: 50
+  save_steps: 50
+
+  # Fraction (0.2) or exact number (500) of eval samples to run during training
+  eval_subset_size: 0.2
+
+  # Number of eval loops without eval_loss improvement before stopping (0 to disable)
+  early_stopping_patience: 10
+
+# ── Data ─────────────────────────────────────────────────────
+# Each entry:
+#   path: absolute path to the JSON file (FIRE format — JSON array)
+data:
+  train_files:
+    - path: "/kaggle/input/fire-dataset/fire_train.json"
+  eval_files:
+    - path: "/kaggle/input/fire-dataset/fire_dev.json"
+  test_files:
+    - path: "/kaggle/input/fire-dataset/fire_test.json"
+
+# ── Labels ───────────────────────────────────────────────────
+# Entity type definitions are embedded directly into the prompts so the
+# model learns the semantic meaning of each label, not just the name.
+labels:
+  entities:
+    Action:              "Corporate actions such as mergers, acquisitions, buy-outs, and restructurings"
+    BusinessUnit:        "Divisions, departments, or subsidiary units within a company"
+    Company:             "Names of corporations, firms, and business organizations"
+    Date:                "Temporal expressions including dates, time periods, and fiscal quarters"
+    Designation:         "Professional titles and roles held by individuals"
+    FinancialEntity:     "Financial instruments, indices, stock tickers, and market indicators"
+    GeopoliticalEntity:  "Countries, states, and political regions referenced in economic context"
+    Location:            "Physical places, addresses, and geographic references"
+    Money:               "Monetary amounts and currency values"
+    Person:              "Names of individuals including executives, analysts, and public figures"
+    Product:             "Goods, services, and branded offerings of companies"
+    Quantity:            "Numerical values, percentages, and measurable quantities"
+    Sector:              "Industry sectors and market segments"

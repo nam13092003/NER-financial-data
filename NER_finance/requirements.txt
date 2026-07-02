@@ -1,0 +1,16 @@
+# Core ML
+torch>=2.1.0
+transformers>=4.40.0
+datasets>=2.18.0
+accelerate>=0.29.0
+peft>=0.10.0
+trl>=0.8.6
+bitsandbytes>=0.43.0
+
+# Unsloth — install separately on Kaggle (see README)
+# unsloth @ git+https://github.com/unslothai/unsloth.git
+
+# Config & utilities
+pyyaml>=6.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
