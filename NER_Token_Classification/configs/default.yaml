@@ -1,46 +1,40 @@
 # ============================================================
 # NER Token Classification — Default Configuration
 # ============================================================
-# Encoder-based BIO token classification for financial NER.
+# Baseline Encoder → BIO Classification
 #
-# Usage:
-#   accelerate launch --multi_gpu --num_processes=2 train.py \
-#       --config configs/default.yaml
-#
-# Or single GPU:
+# Run:
 #   python train.py --config configs/default.yaml
 
 # ── Model ────────────────────────────────────────────────────
 model:
-  # Pre-trained encoder backbone:
-  #   "xlm-roberta-base"          ← multilingual, good baseline
-  #   "xlm-roberta-large"         ← higher capacity
-  #   "vinai/phobert-base-v2"     ← Vietnamese-specific
-  #   "bert-base-cased"           ← English only
-  name: "xlm-roberta-base"
-  max_length: 256
+  # Pre-trained encoder backbone
+  # Options:
+  #   "bert-base-uncased"               ← fast, good baseline
+  #   "roberta-base"                    ← generally better than BERT
+  #   "microsoft/deberta-v3-base"       ← state-of-the-art encoder
+  name: "bert-base-uncased"
+  max_seq_length: 256
   seed: 42
 
 # ── Training ─────────────────────────────────────────────────
 training:
   batch_size: 16
   gradient_accumulation_steps: 2
-  learning_rate: 2.0e-5
+  learning_rate: 5.0e-5
   epochs: 10
   weight_decay: 0.01
   warmup_ratio: 0.1
-  output_dir: "/kaggle/working/outputs_token_cls"
-  logging_steps: 50
-  eval_steps: 200
-  save_steps: 200
-  fp16: true
+  logging_steps: 10
+  eval_steps: 100
+  save_steps: 100
+  output_dir: "/kaggle/working/outputs_ner_token"
 
-  # Early stopping: stop if eval_f1 doesn't improve for N eval rounds
-  early_stopping_patience: 5
-  metric_for_best_model: "eval_f1"
+  # Number of eval loops without improvement before stopping (0 to disable)
+  early_stopping_patience: 3
 
 # ── Data ─────────────────────────────────────────────────────
-# Each entry: path to a FIRE-format JSON file (array of {tokens, entities})
+# Each entry: path to a FIRE-format JSON file (JSON array of records)
 data:
   train_files:
     - path: "/kaggle/input/fire-dataset/fire_train.json"

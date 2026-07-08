@@ -1,24 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Evaluation entry point for BIO-based NER Token Classification.
+"""Evaluation script for NER Token Classification.
 
 Usage::
 
-    # Single GPU
     python evaluate.py \\
         --config configs/default.yaml \\
-        --checkpoint /path/to/best_model \\
-        --output predictions.jsonl
+        --checkpoint /path/to/final_model \\
+        --output /path/to/predictions.json
 
-    # Multi-GPU via accelerate
-    accelerate launch --multi_gpu --num_processes=2 evaluate.py \\
-        --config configs/default.yaml \\
-        --checkpoint /path/to/best_model \\
-        --batch_size 32 \\
-        --output predictions.jsonl
-
-Loads a trained model checkpoint, runs inference on the test set,
-converts BIO predictions back to entity spans, computes entity-level
-metrics, and saves results.
+Loads a fine-tuned ``AutoModelForTokenClassification``, runs inference on
+the test set, and prints entity-level seqeval metrics (P / R / F1 per
+entity type + micro / macro averages).
 """
 
 from __future__ import annotations
@@ -28,87 +20,81 @@ import json
 import logging
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
 import numpy as np
 import torch
-from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
+import yaml
+from seqeval.metrics import classification_report, f1_score
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 from transformers import (
     AutoModelForTokenClassification,
     AutoTokenizer,
-    set_seed,
+    DataCollatorForTokenClassification,
 )
 
-from config import TokenClassificationConfig
-from data.dataset import FireBIODataset
-from data.collator import NERDataCollator
-from data.label_utils import build_label_list, id2label, label2id
+# ── Ensure package imports work when run as a script ─────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 
+from data.dataset import FIREBIODataset
+from utils import ID2LABEL
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# BIO → Entity span conversion
+# Inference
 # ---------------------------------------------------------------------------
 
 
-def bio_tags_to_entities(
-    tokens: List[str],
-    tags: List[str],
-) -> List[dict]:
-    """Convert a BIO tag sequence back to FIRE-format entity spans.
+def predict(
+    model: AutoModelForTokenClassification,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> tuple[List[List[str]], List[List[str]]]:
+    """Run inference and return (true_labels, pred_labels) as BIO strings.
 
-    Args:
-        tokens: Word-level tokens.
-        tags: BIO tag sequence (same length as tokens).
-
-    Returns:
-        List of entity dicts: ``{"text", "type", "start", "end"}``.
+    Only positions with label != -100 are included (i.e. only the first
+    subword of each word, excluding special tokens and padding).
     """
-    entities = []
-    current_entity = None
+    model.eval()
+    all_true: List[List[str]] = []
+    all_pred: List[List[str]] = []
 
-    for i, tag in enumerate(tags):
-        if tag.startswith("B-"):
-            # Save previous entity if any
-            if current_entity is not None:
-                entities.append(current_entity)
-            ent_type = tag[2:]
-            current_entity = {
-                "type": ent_type,
-                "start": i,
-                "end": i + 1,
-                "text": tokens[i] if i < len(tokens) else "",
-            }
-        elif tag.startswith("I-") and current_entity is not None:
-            ent_type = tag[2:]
-            if ent_type == current_entity["type"]:
-                # Continue the current entity
-                current_entity["end"] = i + 1
-                if i < len(tokens):
-                    current_entity["text"] += " " + tokens[i]
-            else:
-                # Type mismatch → close current, start new as B-
-                entities.append(current_entity)
-                current_entity = {
-                    "type": ent_type,
-                    "start": i,
-                    "end": i + 1,
-                    "text": tokens[i] if i < len(tokens) else "",
-                }
-        else:
-            # O tag or I- without a preceding B-
-            if current_entity is not None:
-                entities.append(current_entity)
-                current_entity = None
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
 
-    # Don't forget the last entity
-    if current_entity is not None:
-        entities.append(current_entity)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits  # (batch, seq_len, num_labels)
+            preds = torch.argmax(logits, dim=-1)  # (batch, seq_len)
 
-    return entities
+            # Move to CPU for processing
+            preds_np = preds.cpu().numpy()
+            labels_np = labels.cpu().numpy()
+
+            for pred_seq, label_seq in zip(preds_np, labels_np):
+                true_seq: List[str] = []
+                pred_seq_str: List[str] = []
+
+                for p, l in zip(pred_seq, label_seq):
+                    if l == -100:
+                        continue
+                    true_seq.append(ID2LABEL[l])
+                    pred_seq_str.append(ID2LABEL[p])
+
+                all_true.append(true_seq)
+                all_pred.append(pred_seq_str)
+
+    return all_true, all_pred
 
 
 # ---------------------------------------------------------------------------
@@ -118,21 +104,38 @@ def bio_tags_to_entities(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained token classification model for financial NER."
+        description="Evaluate a fine-tuned NER token classification model."
     )
     parser.add_argument(
-        "--config", type=str, required=True, help="Path to config.yaml"
+        "--config",
+        type=str,
+        required=True,
+        help="Path to the YAML configuration file.",
     )
     parser.add_argument(
-        "--checkpoint", type=str, required=True,
-        help="Path to the saved model directory (best_model).",
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to the saved model directory (e.g. final_model/).",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=32, help="Inference batch size."
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Batch size for inference.",
     )
     parser.add_argument(
-        "--output", type=str, default="predictions.jsonl",
-        help="Path to save prediction results in JSONL format.",
+        "--output",
+        type=str,
+        default=None,
+        help="Path to save the evaluation results JSON.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=["eval", "test"],
+        help="Which split to evaluate: 'eval' (dev) or 'test'.",
     )
     return parser.parse_args()
 
@@ -140,142 +143,69 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-        force=True,
-    )
+    # ── 1. Load config ───────────────────────────────────────────────
+    logger.info("Loading config from: %s", args.config)
+    with open(args.config, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
 
-    config = TokenClassificationConfig.from_yaml(args.config)
-    set_seed(config.model.seed)
+    max_seq_length = cfg["model"].get("max_seq_length", 256)
 
-    # ------------------------------------------------------------------
-    # 1. Load model & tokenizer from checkpoint
-    # ------------------------------------------------------------------
+    # ── 2. Load model & tokenizer from checkpoint ────────────────────
     logger.info("Loading model from checkpoint: %s", args.checkpoint)
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, use_fast=True)
     model = AutoModelForTokenClassification.from_pretrained(args.checkpoint)
+    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    model.eval()
+    model.to(device)
+    logger.info("Using device: %s", device)
 
-    id2lab = id2label()
-    lab2id_map = label2id()
+    # ── 3. Build test dataset ────────────────────────────────────────
+    if args.split == "test":
+        file_paths = [f["path"] for f in cfg["data"]["test_files"]]
+    else:
+        file_paths = [f["path"] for f in cfg["data"]["eval_files"]]
 
-    # ------------------------------------------------------------------
-    # 2. Load test data
-    # ------------------------------------------------------------------
-    test_files = config.data.test_paths
-    if not test_files:
-        logger.warning("No test_files in config; falling back to eval_files.")
-        test_files = config.data.eval_paths
+    logger.info("Loading %s dataset …", args.split)
+    dataset = FIREBIODataset(file_paths, tokenizer, max_length=max_seq_length)
+    logger.info("Loaded %d samples.", len(dataset))
 
-    logger.info("Loading test data from: %s", test_files)
-    test_dataset = FireBIODataset(
-        file_paths=test_files,
+    # ── 4. Build DataLoader ──────────────────────────────────────────
+    data_collator = DataCollatorForTokenClassification(
         tokenizer=tokenizer,
-        max_length=config.model.max_length,
-        lab2id=lab2id_map,
+        padding=True,
+        max_length=max_seq_length,
     )
-    logger.info("Test samples: %d", len(test_dataset))
-
-    collator = NERDataCollator(pad_token_id=tokenizer.pad_token_id or 0)
     dataloader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=data_collator,
     )
 
-    # ------------------------------------------------------------------
-    # 3. Inference
-    # ------------------------------------------------------------------
-    logger.info("Running inference...")
-    all_preds: List[List[str]] = []
-    all_labels: List[List[str]] = []
+    # ── 5. Run prediction ────────────────────────────────────────────
+    logger.info("Running inference …")
+    true_labels, pred_labels = predict(model, dataloader, device)
 
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].numpy()
+    # ── 6. Compute metrics ───────────────────────────────────────────
+    report = classification_report(true_labels, pred_labels, digits=4)
+    micro_f1 = f1_score(true_labels, pred_labels, average="micro")
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits.cpu().numpy()
-            preds = np.argmax(logits, axis=-1)
+    logger.info("\n===== Evaluation Results (%s set) =====\n%s", args.split, report)
+    logger.info("Micro F1: %.4f", micro_f1)
 
-            for pred_seq, label_seq in zip(preds, labels):
-                seq_preds = []
-                seq_labels = []
-                for p, l in zip(pred_seq, label_seq):
-                    if l == -100:
-                        continue
-                    seq_labels.append(id2lab.get(l, "O"))
-                    seq_preds.append(id2lab.get(p, "O"))
-                all_preds.append(seq_preds)
-                all_labels.append(seq_labels)
-
-    # ------------------------------------------------------------------
-    # 4. Compute metrics
-    # ------------------------------------------------------------------
-    logger.info("Computing entity-level metrics...")
-
-    p = precision_score(all_labels, all_preds)
-    r = recall_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds)
-
-    logger.info("Entity-level Precision: %.4f", p)
-    logger.info("Entity-level Recall:    %.4f", r)
-    logger.info("Entity-level F1:        %.4f", f1)
-
-    report = classification_report(all_labels, all_preds, digits=4)
-    logger.info("\nDetailed Classification Report:\n%s", report)
-
-    # ------------------------------------------------------------------
-    # 5. Save predictions as JSONL
-    # ------------------------------------------------------------------
-    logger.info("Converting BIO predictions to entity spans...")
-
-    # Reload raw records to get original tokens
-    raw_records = []
-    for path in test_files:
-        with open(path, encoding="utf-8") as fh:
-            raw_records.extend(json.load(fh))
-
-    os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-
-    with open(args.output, "w", encoding="utf-8") as f_out:
-        for idx, (pred_tags, raw_record) in enumerate(zip(all_preds, raw_records)):
-            tokens = raw_record.get("tokens", [])
-            gold_entities = raw_record.get("entities", [])
-            pred_entities = bio_tags_to_entities(tokens, pred_tags)
-
-            result = {
-                "id": idx,
-                "tokens": tokens,
-                "gold_entities": gold_entities,
-                "predicted_entities": pred_entities,
-                "predicted_bio_tags": pred_tags,
-            }
-            f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
-
-    logger.info("Predictions saved to: %s", args.output)
-
-    # ------------------------------------------------------------------
-    # 6. Summary
-    # ------------------------------------------------------------------
-    summary = {
-        "model": args.checkpoint,
-        "test_samples": len(test_dataset),
-        "precision": round(p, 4),
-        "recall": round(r, 4),
-        "f1": round(f1, 4),
-    }
-    summary_path = args.output.replace(".jsonl", "_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    logger.info("Summary saved to: %s", summary_path)
-
-    logger.info("Evaluation complete.")
+    # ── 7. Save results ──────────────────────────────────────────────
+    if args.output:
+        results = {
+            "split": args.split,
+            "checkpoint": args.checkpoint,
+            "num_samples": len(dataset),
+            "micro_f1": float(micro_f1),
+            "report": report,
+        }
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        logger.info("Results saved to: %s", args.output)
 
 
 if __name__ == "__main__":

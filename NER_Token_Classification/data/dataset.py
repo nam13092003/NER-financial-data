@@ -1,138 +1,163 @@
 # -*- coding: utf-8 -*-
-"""PyTorch Dataset for BIO-based NER token classification on FIRE data.
+"""FIRE → BIO Dataset with subword-to-word alignment.
 
-Implements **first-subword pooling**: for each word, only the first subword
-produced by the tokenizer receives the true BIO label. All subsequent
-subwords of the same word (plus special tokens [CLS], [SEP], padding) are
-assigned ``-100`` so that ``CrossEntropyLoss`` ignores them.
+This module reads FIRE-format JSON files and produces HuggingFace-compatible
+datasets ready for token classification training.
 
-This is equivalent to using the first subword's hidden state as the word
-representation for classification.
+Key design decisions
+--------------------
+- **First-subword pooling for alignment**: Each word is tokenised into one or
+  more subword tokens.  Only the *first* subword of each word receives the
+  real BIO label; all subsequent subwords of the same word receive ``-100``
+  so they are ignored by ``CrossEntropyLoss``.
+- Special tokens (``[CLS]``, ``[SEP]``, etc.) also receive ``-100``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
-import torch
 from torch.utils.data import Dataset
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerBase
 
-from .label_utils import entities_to_bio_tags, label2id
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils import LABEL2ID, build_bio_tags
 
 logger = logging.getLogger(__name__)
 
+# Label assigned to subword tokens that should be ignored in the loss
+IGNORE_INDEX = -100
 
-class FireBIODataset(Dataset):
-    """Load FIRE-format NER data and produce BIO-labelled token sequences.
 
-    Each item returned is a dict with:
-        - ``input_ids``:      (max_length,) int tensor
-        - ``attention_mask``:  (max_length,) int tensor
-        - ``labels``:          (max_length,) int tensor  (``-100`` for ignored positions)
-        - ``word_ids``:        (max_length,) list[Optional[int]]  (for decoding)
+class FIREBIODataset(Dataset):
+    """A ``torch.utils.data.Dataset`` that converts FIRE records to BIO.
 
-    Args:
-        file_paths: List of paths to FIRE JSON files.
-        tokenizer: A HuggingFace *fast* tokenizer (required for ``word_ids()``).
-        max_length: Maximum subword sequence length (truncation & padding).
-        lab2id: Mapping from BIO label string to integer id.
+    Each ``__getitem__`` returns a dict with:
+        - ``input_ids``      : List[int]   — subword token ids
+        - ``attention_mask``  : List[int]   — 1 for real tokens, 0 for padding
+        - ``labels``          : List[int]   — BIO label ids (``-100`` for ignored)
+
+    Parameters
+    ----------
+    file_paths : list of str or Path
+        Paths to FIRE JSON files (each is a JSON array of records).
+    tokenizer : PreTrainedTokenizerBase
+        HuggingFace tokenizer (e.g. ``AutoTokenizer.from_pretrained(...)``).
+    max_length : int
+        Maximum subword sequence length (including special tokens).
     """
 
     def __init__(
         self,
-        file_paths: List[str],
-        tokenizer: PreTrainedTokenizerFast,
+        file_paths: List[Union[str, Path]],
+        tokenizer: PreTrainedTokenizerBase,
         max_length: int = 256,
-        lab2id: Optional[Dict[str, int]] = None,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.lab2id = lab2id or label2id()
+        self.samples: List[Dict[str, Any]] = []
 
-        # Load all records
-        self.records: List[dict] = []
-        for path in file_paths:
-            self.records.extend(self._load_file(path))
-        logger.info("Loaded %d records from %d file(s).", len(self.records), len(file_paths))
+        for fpath in file_paths:
+            self._load_file(fpath)
+
+        logger.info(
+            "Loaded %d samples from %d file(s).", len(self.samples), len(file_paths)
+        )
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    def _load_file(self, file_path: Union[str, Path]) -> None:
+        """Parse a single FIRE JSON file and append samples."""
+        file_path = Path(file_path)
+        if not file_path.exists():
+            logger.warning("File not found, skipping: %s", file_path)
+            return
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+
+        for idx, record in enumerate(records):
+            tokens = record.get("tokens", [])
+            if not tokens:
+                continue
+
+            entities = record.get("entities", [])
+            bio_tags = build_bio_tags(tokens, entities)
+
+            self.samples.append(
+                {
+                    "tokens": tokens,
+                    "bio_tags": bio_tags,
+                }
+            )
 
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        record = self.records[idx]
-        tokens: List[str] = record["tokens"]
-        entities: List[dict] = record.get("entities", [])
+    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
+        sample = self.samples[idx]
+        tokens: List[str] = sample["tokens"]
+        bio_tags: List[str] = sample["bio_tags"]
 
-        # 1. Convert entities → word-level BIO tags
-        bio_tags = entities_to_bio_tags(tokens, entities)
+        return self._tokenize_and_align(tokens, bio_tags)
 
-        # 2. Tokenize using the fast tokenizer with is_split_into_words=True
-        #    This tells the tokenizer that `tokens` is already word-split,
-        #    and it will further split each word into subwords.
-        encoding = self.tokenizer(
-            tokens,
+    # ------------------------------------------------------------------
+    # Subword → Word alignment
+    # ------------------------------------------------------------------
+
+    def _tokenize_and_align(
+        self,
+        words: List[str],
+        word_labels: List[str],
+    ) -> Dict[str, List[int]]:
+        """Tokenize words and align BIO labels to subword tokens.
+
+        Strategy — **first subword pooling**:
+        - For each word, only the first subword gets the real label.
+        - Subsequent subwords of the same word get ``-100``.
+        - Special tokens (``[CLS]``, ``[SEP]``) get ``-100``.
+
+        Returns
+        -------
+        dict with ``input_ids``, ``attention_mask``, ``labels``
+        """
+        tokenized = self.tokenizer(
+            words,
             is_split_into_words=True,
             truncation=True,
             max_length=self.max_length,
-            padding=False,  # collator handles padding
-            return_tensors=None,
+            padding=False,           # Padding is handled by the collator
+            return_offsets_mapping=False,
         )
 
-        # 3. Align word-level BIO tags to subword tokens
-        #    word_ids() returns None for special tokens ([CLS], [SEP], padding)
-        #    and the word index for each subword token.
-        word_ids = encoding.word_ids()
-        aligned_labels = []
-        previous_word_id = None
+        word_ids = tokenized.word_ids()  # None for special tokens, int for word idx
+
+        labels: List[int] = []
+        previous_word_id: Optional[int] = None
 
         for word_id in word_ids:
             if word_id is None:
-                # Special token → ignore in loss
-                aligned_labels.append(-100)
+                # Special token ([CLS], [SEP], etc.)
+                labels.append(IGNORE_INDEX)
             elif word_id != previous_word_id:
-                # First subword of a new word → assign the real BIO label
-                if word_id < len(bio_tags):
-                    tag = bio_tags[word_id]
-                    aligned_labels.append(self.lab2id.get(tag, 0))
-                else:
-                    aligned_labels.append(-100)
+                # First subword of a new word → assign real label
+                labels.append(LABEL2ID[word_labels[word_id]])
             else:
-                # Subsequent subword of the same word → ignore in loss
-                aligned_labels.append(-100)
+                # Continuation subword of the same word → ignore
+                labels.append(IGNORE_INDEX)
+
             previous_word_id = word_id
 
-        return {
-            "input_ids": encoding["input_ids"],
-            "attention_mask": encoding["attention_mask"],
-            "labels": aligned_labels,
-        }
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _load_file(path: str) -> List[dict]:
-        """Read a FIRE JSON file (array of records)."""
-        try:
-            with open(path, encoding="utf-8") as fh:
-                records = json.load(fh)
-            if not isinstance(records, list):
-                logger.error("Expected JSON array in '%s', got %s.", path, type(records).__name__)
-                return []
-            logger.info("Loaded %d records from '%s'.", len(records), path)
-            return records
-        except FileNotFoundError:
-            logger.error("File not found: '%s'", path)
-            return []
-        except json.JSONDecodeError as exc:
-            logger.error("Malformed JSON in '%s': %s", path, exc)
-            return []
+        tokenized["labels"] = labels
+        return dict(tokenized)

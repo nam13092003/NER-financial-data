@@ -1,80 +1,54 @@
 # -*- coding: utf-8 -*-
-"""Model factory for BIO-based NER Token Classification.
+"""NER Token Classification model.
 
-Uses ``AutoModelForTokenClassification`` from HuggingFace Transformers
-with a pre-trained encoder backbone. The classification head maps each
-subword hidden state to one of the BIO labels.
+Provides a thin wrapper around ``AutoModelForTokenClassification`` from
+HuggingFace Transformers, pre-configured with the BIO label set from the
+FIRE financial NER dataset.
 
-**First-subword pooling** is handled implicitly: only the first subword
-of each word has a real label; subsequent subwords are labelled ``-100``
-and are therefore ignored by the loss function. This means the model
-learns to classify based on the first subword's representation.
+The model architecture is:
+
+    Input IDs → Encoder (BERT / RoBERTa / DeBERTa) → last_hidden_state
+        → Dropout → Linear(hidden_size, 27) → logits
+
+Subword-to-word alignment is handled at the *data* level (see
+``data/dataset.py``): only the first subword of each word receives a real
+BIO label; all other subwords receive ``-100`` and are therefore ignored
+by the cross-entropy loss computed internally by the HuggingFace model.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Tuple
+from transformers import AutoModelForTokenClassification, AutoConfig
 
-from transformers import (
-    AutoConfig,
-    AutoModelForTokenClassification,
-    AutoTokenizer,
-    PreTrainedModel,
-    PreTrainedTokenizerFast,
-)
-
-from data.label_utils import build_label_list, label2id, id2label
-
-logger = logging.getLogger(__name__)
+from utils import NUM_LABELS, LABEL2ID, ID2LABEL
 
 
-def load_model_and_tokenizer(
-    model_name: str,
-) -> Tuple[PreTrainedModel, PreTrainedTokenizerFast]:
-    """Load a pre-trained encoder with a token classification head.
+def build_model(model_name: str) -> AutoModelForTokenClassification:
+    """Instantiate a token classification model from a pre-trained encoder.
 
-    Args:
-        model_name: HuggingFace model identifier
-            (e.g., ``"xlm-roberta-base"``, ``"vinai/phobert-base-v2"``).
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model identifier, e.g. ``"bert-base-uncased"``,
+        ``"roberta-base"``, ``"microsoft/deberta-v3-base"``.
 
-    Returns:
-        ``(model, tokenizer)`` — both ready for fine-tuning.
+    Returns
+    -------
+    AutoModelForTokenClassification
+        A model with a linear classification head on top of the encoder,
+        configured with the BIO label set (27 labels).
     """
-    label_list = build_label_list()
-    num_labels = len(label_list)
-    lab2id = label2id()
-    id2lab = id2label()
-
-    logger.info(
-        "Loading encoder: %s (num_labels=%d)", model_name, num_labels
-    )
-
-    # Load tokenizer (must be a fast tokenizer for word_ids() support)
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        use_fast=True,
-        add_prefix_space=True,  # Needed for RoBERTa-family models
-    )
-
-    # Load model config and override label mappings
     config = AutoConfig.from_pretrained(
         model_name,
-        num_labels=num_labels,
-        label2id=lab2id,
-        id2label=id2lab,
+        num_labels=NUM_LABELS,
+        label2id=LABEL2ID,
+        id2label=ID2LABEL,
     )
 
     model = AutoModelForTokenClassification.from_pretrained(
         model_name,
         config=config,
-        ignore_mismatched_sizes=True,  # classifier head size may differ
+        ignore_mismatched_sizes=True,  # classifier head will be re-initialised
     )
 
-    logger.info(
-        "Model loaded: %s — %d parameters",
-        model_name,
-        sum(p.numel() for p in model.parameters()),
-    )
-
-    return model, tokenizer
+    return model
