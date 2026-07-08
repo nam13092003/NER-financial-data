@@ -10,18 +10,19 @@
 model:
   # Pre-trained encoder backbone
   # Options:
+  #   "FacebookAI/xlm-roberta-large"    ← high performance multilingual encoder
   #   "bert-base-uncased"               ← fast, good baseline
   #   "roberta-base"                    ← generally better than BERT
   #   "microsoft/deberta-v3-base"       ← state-of-the-art encoder
-  name: "bert-base-uncased"
+  name: "FacebookAI/xlm-roberta-large"
   max_seq_length: 256
   seed: 42
 
 # ── Training ─────────────────────────────────────────────────
 training:
-  batch_size: 16
-  gradient_accumulation_steps: 2
-  learning_rate: 5.0e-5
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  learning_rate: 1.5e-5
   epochs: 10
   weight_decay: 0.01
   warmup_ratio: 0.1
