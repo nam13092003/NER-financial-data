@@ -152,7 +152,9 @@ def build_training_args(cfg: dict, num_train_samples: int) -> TrainingArguments:
         metric_for_best_model="f1" if (patience > 0) else None,
         greater_is_better=True if (patience > 0) else None,
         save_total_limit=3,
+        # DDP / gradient-checkpointing safety flags
         ddp_find_unused_parameters=False,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
 
