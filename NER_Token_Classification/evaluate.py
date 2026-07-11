@@ -103,6 +103,75 @@ def predict(
     return all_true, all_pred
 
 
+def bio_tags_to_entities(tokens: List[str], tags: List[str]) -> List[dict]:
+    """Convert a sequence of word tokens and corresponding BIO tags to entity dicts."""
+    entities = []
+    current_entity = None
+    entity_idx = 0
+
+    for idx, (token, tag) in enumerate(zip(tokens, tags)):
+        if tag.startswith("B-"):
+            if current_entity:
+                entities.append(current_entity)
+            current_entity = {
+                "id": f"T{entity_idx}",
+                "label": tag[2:],
+                "tokens": [token],
+            }
+            entity_idx += 1
+        elif tag.startswith("I-"):
+            etype = tag[2:]
+            if current_entity and current_entity["label"] == etype:
+                current_entity["tokens"].append(token)
+            else:
+                if current_entity:
+                    entities.append(current_entity)
+                current_entity = {
+                    "id": f"T{entity_idx}",
+                    "label": etype,
+                    "tokens": [token],
+                }
+                entity_idx += 1
+        else:  # "O"
+            if current_entity:
+                entities.append(current_entity)
+                current_entity = None
+
+    if current_entity:
+        entities.append(current_entity)
+
+    formatted_entities = []
+    for ent in entities:
+        term = " ".join(ent["tokens"])
+        formatted_entities.append({
+            "id": ent["id"],
+            "label": ent["label"],
+            "term": term,
+        })
+    return formatted_entities
+
+
+def reorder_gathered_predictions(gathered_list: list, num_samples: int, num_processes: int) -> list:
+    """Reorder a list gathered by accelerator.gather_for_metrics back to original dataset order."""
+    if num_processes <= 1:
+        return gathered_list
+
+    import math
+    k = math.ceil(num_samples / num_processes)
+
+    # Pre-allocate reconstructed list
+    reconstructed = [None] * num_samples
+
+    for r in range(num_processes):
+        for j in range(k):
+            concat_idx = r * k + j
+            orig_idx = j * num_processes + r
+            if orig_idx < num_samples and concat_idx < len(gathered_list):
+                reconstructed[orig_idx] = gathered_list[concat_idx]
+
+    return reconstructed
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -135,6 +204,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to save the evaluation results JSON.",
+    )
+    parser.add_argument(
+        "--predictions",
+        type=str,
+        default=None,
+        help="Path to save the model prediction outputs in JSONL format (similar to NER_finance).",
     )
     parser.add_argument(
         "--split",
@@ -205,6 +280,13 @@ def main() -> None:
 
     # ── 6. Compute metrics and save (only on main process) ───────────
     if accelerator.is_main_process:
+        # Reorder gathered predictions back to the original dataset order
+        true_labels = reorder_gathered_predictions(
+            true_labels, len(dataset), accelerator.num_processes
+        )
+        pred_labels = reorder_gathered_predictions(
+            pred_labels, len(dataset), accelerator.num_processes
+        )
         report = classification_report(true_labels, pred_labels, digits=4)
         micro_f1 = f1_score(true_labels, pred_labels, average="micro")
 
@@ -224,6 +306,23 @@ def main() -> None:
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
             logger.info("Results saved to: %s", args.output)
+
+        # ── 8. Save raw predictions (JSONL format, similar to NER_finance) ──
+        pred_out_path = args.predictions
+        if not pred_out_path and args.output:
+            # Auto-derive predictions path if only --output is provided
+            base, ext = os.path.splitext(args.output)
+            pred_out_path = f"{base}_predictions.jsonl"
+
+        if pred_out_path:
+            os.makedirs(os.path.dirname(pred_out_path) or ".", exist_ok=True)
+            with open(pred_out_path, "w", encoding="utf-8") as f:
+                for idx in range(len(dataset)):
+                    tokens = dataset.samples[idx]["tokens"]
+                    tags = pred_labels[idx]
+                    entities = bio_tags_to_entities(tokens, tags)
+                    f.write(json.dumps({"entities": entities}, ensure_ascii=False) + "\n")
+            logger.info("Predictions saved to: %s", pred_out_path)
 
 
 if __name__ == "__main__":
