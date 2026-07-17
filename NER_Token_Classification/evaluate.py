@@ -151,23 +151,34 @@ def bio_tags_to_entities(tokens: List[str], tags: List[str]) -> List[dict]:
     return formatted_entities
 
 
-def reorder_gathered_predictions(gathered_list: list, num_samples: int, num_processes: int) -> list:
+def reorder_gathered_predictions(
+    gathered_list: list,
+    num_samples: int,
+    num_processes: int,
+    batch_size: int,
+) -> list:
     """Reorder a list gathered by accelerator.gather_for_metrics back to original dataset order."""
     if num_processes <= 1:
         return gathered_list
 
-    import math
-    k = math.ceil(num_samples / num_processes)
-
     # Pre-allocate reconstructed list
     reconstructed = [None] * num_samples
 
-    for r in range(num_processes):
-        for j in range(k):
-            concat_idx = r * k + j
-            orig_idx = j * num_processes + r
-            if orig_idx < num_samples and concat_idx < len(gathered_list):
-                reconstructed[orig_idx] = gathered_list[concat_idx]
+    import math
+    k = math.ceil(num_samples / num_processes)
+    num_batches = math.ceil(k / batch_size)
+
+    concat_idx = 0
+    for b in range(num_batches):
+        b_size = min(batch_size, k - b * batch_size)
+        # Each batch gathered contains b_size samples from process 0, then process 1, etc.
+        for r in range(num_processes):
+            for i in range(b_size):
+                j = b * batch_size + i
+                orig_idx = j * num_processes + r
+                if orig_idx < num_samples and concat_idx < len(gathered_list):
+                    reconstructed[orig_idx] = gathered_list[concat_idx]
+                concat_idx += 1
 
     return reconstructed
 
@@ -282,10 +293,10 @@ def main() -> None:
     if accelerator.is_main_process:
         # Reorder gathered predictions back to the original dataset order
         true_labels = reorder_gathered_predictions(
-            true_labels, len(dataset), accelerator.num_processes
+            true_labels, len(dataset), accelerator.num_processes, args.batch_size
         )
         pred_labels = reorder_gathered_predictions(
-            pred_labels, len(dataset), accelerator.num_processes
+            pred_labels, len(dataset), accelerator.num_processes, args.batch_size
         )
         report = classification_report(true_labels, pred_labels, digits=4)
         micro_f1 = f1_score(true_labels, pred_labels, average="micro")

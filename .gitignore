@@ -5,3 +5,4 @@ outputs_ner/
 *.log
 *.txt
 .ipynb_checkpoints/
+analyzed_errors/*
